@@ -31,6 +31,7 @@ all() ->
     [ {group, kill_connection_process}
     , {group, no_kill_connection_process}
     , {group, snabbkaffe}
+    , {group, gc_tests}
     ].
 
 %% A persistent session can be resumed in two ways:
@@ -48,7 +49,8 @@ all() ->
 groups() ->
     TCs = emqx_ct:all(?MODULE),
     SnabbkaffeTCs = [TC || TC <- TCs, is_snabbkaffe_tc(TC)],
-    OtherTCs = TCs -- SnabbkaffeTCs,
+    GCTests  = [TC || TC <- TCs, is_gc_tc(TC)],
+    OtherTCs = (TCs -- SnabbkaffeTCs) -- GCTests,
     [ {no_kill_connection_process, [], [{group, tcp}, {group, quic}]}
     , {   kill_connection_process, [], [{group, tcp}, {group, quic}]}
     , {snabbkaffe, [], [{group, tcp_snabbkaffe}, {group, quic_snabbkaffe}]}
@@ -56,10 +58,15 @@ groups() ->
     , {quic, [], OtherTCs}
     , {tcp_snabbkaffe,  [], SnabbkaffeTCs}
     , {quic_snabbkaffe, [], SnabbkaffeTCs}
+    , {gc_tests, [], GCTests}
     ].
 
 is_snabbkaffe_tc(TC) ->
-    re:run(atom_to_list(TC), "snabbkaffe") /= nomatch.
+    re:run(atom_to_list(TC), "^t_snabbkaffe_") /= nomatch.
+
+is_gc_tc(TC) ->
+    re:run(atom_to_list(TC), "^t_gc_") /= nomatch.
+
 
 init_per_group(Group, Config) when Group == tcp; Group == tcp_snabbkaffe ->
     [ {port, 1883}, {conn_fun, connect}| Config];
@@ -70,8 +77,23 @@ init_per_group(no_kill_connection_process, Config) ->
 init_per_group(kill_connection_process, Config) ->
     [ {kill_connection_process, true} | Config];
 init_per_group(snabbkaffe, Config) ->
-    [ {kill_connection_process, true} | Config].
-
+    [ {kill_connection_process, true} | Config];
+init_per_group(gc_tests, Config) ->
+    %% We need to make sure the system does not interfere with this test group.
+    emqx_ct_helpers:stop_apps([]),
+    Ets = gc_tests_store,
+    Pid = spawn(fun() ->
+                        ets:new(Ets, [named_table, public, ordered_set]),
+                        receive stop -> ok end
+                end),
+    meck:new(mnesia, [non_strict, passthrough, no_history, no_link]),
+    meck:expect(mnesia, dirty_first, fun(emqx_session_msg) -> ets:first(Ets);
+                                        (X) -> meck:passtrhough(X)
+                                     end),
+    meck:expect(mnesia, dirty_next, fun(emqx_session_msg, X) -> ets:next(Ets, X);
+                                       (Tab, X) -> meck:passtrough([Tab, X])
+                                    end),
+    [{store_owner, Pid}, {store, Ets} | Config].
 
 init_per_suite(Config) ->
     %% Start Apps
@@ -88,11 +110,22 @@ set_special_confs(_) ->
 end_per_suite(_Config) ->
     emqx_ct_helpers:stop_apps([]).
 
+end_per_group(gc_tests, Config) ->
+    meck:unload(mnesia),
+    ?config(store_owner, Config) ! stop,
+    ok;
 end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(TestCase, Config) ->
     Config1 = preconfig_per_testcase(TestCase, Config),
+    case is_gc_tc(TestCase) of
+        true ->
+            Store = ?config(store, Config),
+            ets:delete_all_objects(Store);
+        false ->
+            skip
+    end,
     case erlang:function_exported(?MODULE, TestCase, 2) of
         true -> ?MODULE:TestCase(init, Config1);
         _ -> Config1
@@ -117,11 +150,17 @@ preconfig_per_testcase(TestCase, Config) ->
                 {atom_to_binary(TestCase),
                  init_per_group(tcp, init_per_group(kill_connection_process, Config))};
             [{name, GroupName}] ->
-                [[{name,TopName}]] = ?config(tc_group_path, Config),
-                {iolist_to_binary([atom_to_binary(TopName), "_",
-                                   atom_to_binary(GroupName), "_",
-                                   atom_to_binary(TestCase)]),
-                 Config}
+                case ?config(tc_group_path, Config) of
+                    [[{name,TopName}]] ->
+                        {iolist_to_binary([atom_to_binary(TopName), "_",
+                                           atom_to_binary(GroupName), "_",
+                                           atom_to_binary(TestCase)]),
+                         Config};
+                    [] ->
+                        {iolist_to_binary([atom_to_binary(GroupName), "_",
+                                           atom_to_binary(TestCase)]),
+                         Config}
+                end
         end,
     [ {topic, iolist_to_binary([BaseName, "/foo"])}
     , {stopic, iolist_to_binary([BaseName, "/+"])}
@@ -620,3 +659,106 @@ t_snabbkaffe_buffered_messages(Config) ->
                             length(Msgs))
        end),
     ok.
+
+%%--------------------------------------------------------------------
+%% GC tests
+%%--------------------------------------------------------------------
+
+-define(MARKER, 3).
+-define(DELIVERED, 2).
+-define(UNDELIVERED, 1).
+-define(ABANDONED, 0).
+
+msg_id() ->
+    emqx_guid:gen().
+
+delivered_msg(MsgId, SessionID, STopic) ->
+    {SessionID, MsgId, STopic, ?DELIVERED}.
+
+undelivered_msg(MsgId, SessionID, STopic) ->
+    {SessionID, MsgId, STopic, ?UNDELIVERED}.
+
+marker(MarkerID, SessionID) ->
+    {SessionID, MarkerID, <<>>, ?MARKER}.
+
+abandoned(SessionID) ->
+    {SessionID, <<>>, <<>>, ?ABANDONED}.
+
+t_gc_all_delivered(Config) ->
+    Store = ?config(store, Config),
+    STopic = ?config(stopic, Config),
+    SessionId = emqx_guid:gen(),
+    MsgIds = [msg_id() || _ <- lists:seq(1, 5)],
+    Delivered = [delivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    Undelivered = [undelivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    SortedContent = lists:reverse(lists:usort(Delivered ++ Undelivered)),
+    ets:insert(Store, [{X, <<>>} || X <- SortedContent]),
+    GCMessages = emqx_persistent_session:gc_session_messages(),
+    ?assertEqual(SortedContent, GCMessages),
+    ok.
+
+t_gc_some_undelivered(Config) ->
+    Store = ?config(store, Config),
+    STopic = ?config(stopic, Config),
+    SessionId = emqx_guid:gen(),
+    MsgIds = [msg_id() || _ <- lists:seq(1, 10)],
+    Delivered = [delivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    {Delivered1,_Delivered2} = split(Delivered),
+    Undelivered = [undelivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    {Undelivered1, Undelivered2} = split(Undelivered),
+    SortedContent = lists:reverse(lists:usort(Delivered1 ++ Undelivered1 ++ Undelivered2)),
+    ets:insert(Store, [{X, <<>>} || X <- SortedContent]),
+    Expected = lists:reverse(lists:usort(Delivered1 ++ Undelivered1)),
+    GCMessages = emqx_persistent_session:gc_session_messages(),
+    ?assertEqual(Expected, GCMessages),
+    ok.
+
+t_gc_with_markers(Config) ->
+    Store = ?config(store, Config),
+    STopic = ?config(stopic, Config),
+    SessionId = emqx_guid:gen(),
+    MsgIds1 = [msg_id() || _ <- lists:seq(1, 4)],
+    MarkerId = msg_id(),
+    MsgIds = [msg_id() || _ <- lists:seq(1, 4)] ++ MsgIds1,
+    Delivered = [delivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    {Delivered1,_Delivered2} = split(Delivered),
+    Undelivered = [undelivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    {Undelivered1, Undelivered2} = split(Undelivered),
+    Markers = [marker(MarkerId, SessionId)],
+    SortedContent = lists:reverse(lists:usort(Delivered1 ++ Undelivered1 ++ Undelivered2 ++ Markers)),
+    ets:insert(Store, [{X, <<>>} || X <- SortedContent]),
+    Expected = lists:reverse(lists:usort(Delivered1 ++ Undelivered1)),
+    GCMessages = emqx_persistent_session:gc_session_messages(),
+    ?assertEqual(Expected, GCMessages),
+    ok.
+
+t_gc_abandoned_some_undelivered(Config) ->
+    Store = ?config(store, Config),
+    STopic = ?config(stopic, Config),
+    SessionId = emqx_guid:gen(),
+    MsgIds = [msg_id() || _ <- lists:seq(1, 10)],
+    Delivered = [delivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    {Delivered1,_Delivered2} = split(Delivered),
+    Undelivered = [undelivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    {Undelivered1, Undelivered2} = split(Undelivered),
+    Abandoned = abandoned(SessionId),
+    SortedContent = lists:reverse(lists:usort(Delivered1 ++ Undelivered1 ++
+                                                  Undelivered2 ++ [Abandoned])),
+    ets:insert(Store, [{X, <<>>} || X <- SortedContent]),
+    Expected = lists:reverse(lists:usort(Delivered1 ++ Undelivered1 ++ Undelivered2)),
+    GCMessages = emqx_persistent_session:gc_session_messages(),
+    ?assertEqual(Expected, GCMessages),
+    ok.
+
+
+
+split(List) ->
+    split(List, [], []).
+
+split([], L1, L2) ->
+    {L1, L2};
+split([H], L1, L2) ->
+    {[H|L1], L2};
+split([H1, H2|Left], L1, L2) ->
+    split(Left, [H1|L1], [H2|L2]).
+

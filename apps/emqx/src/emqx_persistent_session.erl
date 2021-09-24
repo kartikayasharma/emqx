@@ -35,6 +35,7 @@
         ]).
 
 -export([ pending_messages_in_db/2
+        , gc_session_messages/0
         ]).
 
 -export([ mnesia/1
@@ -51,9 +52,9 @@
 
 %% NOTE: Order is significant because of traversal order of the table.
 -define(MARKER, 3).
--define(ABANDONED, 2).
--define(DELIVERED, 1).
--define(UNDELIVERED, 0).
+-define(DELIVERED, 2).
+-define(UNDELIVERED, 1).
+-define(ABANDONED, 0).
 -type pending_tag() :: ?DELIVERED | ?UNDELIVERED | ?ABANDONED | ?MARKER.
 
 %%--------------------------------------------------------------------
@@ -377,14 +378,13 @@ read_pending_msgs([{MsgId, STopic}|Left], Acc) ->
 read_pending_msgs([], Acc) ->
     lists:reverse(Acc).
 
-
 %% The keys are ordered by
 %%     {sessionID(), <<>>, <<>>, ?ABANDONED} For abandoned sessions (clean started or expired).
 %%     {sessionID(), emqx_guid:guid(), STopic :: binary(), ?DELIVERED | ?UNDELIVERED | ?MARKER}
 %%  where
 %%     <<>> < emqx_guid:guid()
 %%     emqx_guid:guid() is ordered in ts() and by node()
-%%     ?UNDELIVERED < ?DELIVERED < ?MARKER
+%%     ?ABANDONED < ?UNDELIVERED < ?DELIVERED < ?MARKER
 %%
 %% We traverse the table until we reach another session.
 %% TODO: Garbage collect the delivered messages.
@@ -413,3 +413,41 @@ pending_messages({SessionID, PrevMsgId, PrevSTopic, PrevTag} = PrevKey, Acc, Mar
                 true  -> {lists:reverse([{PrevMsgId, PrevSTopic}|Acc]), MarkerIds}
             end
     end.
+
+%%--------------------------------------------------------------------
+%% Garbage collection
+%%--------------------------------------------------------------------
+
+gc_session_messages() ->
+    gc_traverse(first_session_message(), <<>>, false, []).
+
+gc_traverse('$end_of_table', _SessionID, _Abandoned, Delete) ->
+    Delete;
+gc_traverse({S, <<>>, <<>>, ?ABANDONED} = Key, _SessionID, _Abandoned, Delete) ->
+    %% TODO: Delete abandoned marker under some conditions.
+    gc_traverse(next_session_message(Key), S, true, Delete);
+gc_traverse({S, _MsgID, <<>>, ?MARKER} = Key, SessionID, Abandoned, Delete) ->
+    %% TODO: Delete marker under some conditions.
+    NewAbandoned = S =:= SessionID andalso Abandoned,
+    gc_traverse(next_session_message(Key), S, NewAbandoned, Delete);
+gc_traverse({S, _MsgID, _STopic, _Tag} = Key, SessionID, Abandoned, Delete) when Abandoned andalso
+                                                                                 S =:= SessionID ->
+    %% Delete all messages from an abandoned session.
+    gc_traverse(next_session_message(Key), S, Abandoned, [Key|Delete]);
+gc_traverse({S, MsgID, STopic, ?UNDELIVERED} = Key, SessionID, Abandoned, Delete) ->
+    case next_session_message(Key) of
+        {S1, M, ST, ?DELIVERED} = NextKey when S1     =:= S andalso
+                                               MsgID  =:= M andalso
+                                               STopic =:= ST ->
+            %% We have both markers for the same message/topic so it is safe to delete both.
+            NewDelete = [NextKey, Key | Delete],
+            gc_traverse(next_session_message(NextKey), S, Abandoned, NewDelete);
+        NextKey ->
+            %% Something else is here, so let's just loop.
+            NewAbandoned = S =:= SessionID andalso Abandoned,
+            gc_traverse(NextKey, SessionID, NewAbandoned, Delete)
+    end;
+gc_traverse({S, _MsgID, _STopic, ?DELIVERED} = Key, SessionID, Abandoned, Delete) ->
+    %% We have a message that is marked as ?DELIVERED, but the ?UNDELIVERED is missing.
+    NewAbandoned = S =:= SessionID andalso Abandoned,
+    gc_traverse(next_session_message(Key), S, NewAbandoned, Delete).
