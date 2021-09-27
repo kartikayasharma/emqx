@@ -16,8 +16,8 @@
 
 -module(emqx_persistent_session).
 
--export([ discard/1
-        , discard/2
+-export([ discard/2
+        , discard_if_present/1
         , lookup/1
         , persist/3
         , persist_message/1
@@ -193,8 +193,8 @@ lookup(ClientID) when is_binary(ClientID) ->
             end
     end.
 
--spec discard(binary()) -> 'ok'.
-discard(ClientID) ->
+-spec discard_if_present(binary()) -> 'ok'.
+discard_if_present(ClientID) ->
     case lookup(ClientID) of
         [] -> ok;
         [Session] ->

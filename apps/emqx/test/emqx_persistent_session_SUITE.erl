@@ -678,10 +678,10 @@ delivered_msg(MsgId, SessionID, STopic) ->
 undelivered_msg(MsgId, SessionID, STopic) ->
     {SessionID, MsgId, STopic, ?UNDELIVERED}.
 
-marker(MarkerID, SessionID) ->
+marker_msg(MarkerID, SessionID) ->
     {SessionID, MarkerID, <<>>, ?MARKER}.
 
-abandoned(SessionID) ->
+abandoned_session_msg(SessionID) ->
     {SessionID, <<>>, <<>>, ?ABANDONED}.
 
 t_gc_all_delivered(Config) ->
@@ -724,7 +724,7 @@ t_gc_with_markers(Config) ->
     {Delivered1,_Delivered2} = split(Delivered),
     Undelivered = [undelivered_msg(X, SessionId, STopic) || X <- MsgIds],
     {Undelivered1, Undelivered2} = split(Undelivered),
-    Markers = [marker(MarkerId, SessionId)],
+    Markers = [marker_msg(MarkerId, SessionId)],
     SortedContent = lists:reverse(lists:usort(Delivered1 ++ Undelivered1 ++ Undelivered2 ++ Markers)),
     ets:insert(Store, [{X, <<>>} || X <- SortedContent]),
     Expected = lists:reverse(lists:usort(Delivered1 ++ Undelivered1)),
@@ -741,7 +741,7 @@ t_gc_abandoned_some_undelivered(Config) ->
     {Delivered1,_Delivered2} = split(Delivered),
     Undelivered = [undelivered_msg(X, SessionId, STopic) || X <- MsgIds],
     {Undelivered1, Undelivered2} = split(Undelivered),
-    Abandoned = abandoned(SessionId),
+    Abandoned = abandoned_session_msg(SessionId),
     SortedContent = lists:reverse(lists:usort(Delivered1 ++ Undelivered1 ++
                                                   Undelivered2 ++ [Abandoned])),
     ets:insert(Store, [{X, <<>>} || X <- SortedContent]),
@@ -749,8 +749,6 @@ t_gc_abandoned_some_undelivered(Config) ->
     GCMessages = emqx_persistent_session:gc_session_messages(),
     ?assertEqual(Expected, GCMessages),
     ok.
-
-
 
 split(List) ->
     split(List, [], []).
